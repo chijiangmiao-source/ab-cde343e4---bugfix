@@ -9,7 +9,12 @@
  *   3. DFS 线段树，进入节点时把关系并入“可回滚带势并查集”，离开时按快照回滚。
  *      并查集只按大小合并不做路径压缩，pot[x] = x 的读数 - 父节点读数，
  *      回滚即恢复 parent/size/pot/link，总复杂度 O((E+K) log K · α)。
- *   4. 合并已连通的两端时若 pot 推出的偏移与登记值不符，即得到一个矛盾环。
+ *   4. 分治森林只负责判定可行性：其形态随检查点在线段树上的位置而变，不能直接
+ *      用来取证。判定为冲突的叶节点，改用“当前仍活动的关系集合”本身规范构造
+ *      矛盾环：凡在删掉自己的活动关系图中两端仍连通、且沿森林推出的偏移与登记
+ *      值不符的关系，都是不相容环上的候选，候选中取关系标识最小者，环由其余
+ *      关系的森林路径逐项相加拼成。见证只由活动集合决定，同一活动集合在任何
+ *      检查点位置都得到同一矛盾环标识、推导值与冲突值。
  *
  * 同一份文件既可作为浏览器普通脚本（window.DSCable），也可在 Node 中被测试引用。
  */
@@ -141,6 +146,139 @@
   }
 
   /**
+   * 由“当前仍活动的关系集合”本身规范构造矛盾环（与检查点位置无关）。
+   *
+   * 活动关系构成带势无向图 G。一条关系 e: u→v=d 确实落在某个不相容环上，
+   * 当且仅当 G−e 中 u、v 仍连通，且存在一条 u→v 路径其权值和 ≠ d。
+   * 按关系标识升序枚举，第一条满足的关系即稳定选出的最小标识；环由 G−e
+   * 的生成树路径（必要时借道一条矛盾回边）拼成，环上各式逐项相加即为
+   * 推导值，e 的登记值为冲突值。返回的 value/rootOf 是 G−e 生成树在同一
+   * 确定性遍历下赋予的势，供冲突页稳定展示推导读数。
+   *
+   * @returns {Object|null} {edge, derived, ring, value, rootOf}；相容时返回 null
+   */
+  function canonicalWitness(edges, n, index) {
+    const sorted = edges.slice().sort(byIdAsc);
+
+    // 环中一行：行走式 x_plus − x_minus = contrib（行走方向为 minus→plus）
+    const rowOf = (e, plus, minus) => ({
+      id: e.id,
+      u: e.u,
+      v: e.v,
+      d: e.d,
+      line: e.line,
+      plus,
+      minus,
+      reversed: plus === e.u, // plus 为登记起点 u 时，行走与登记方向相反
+      contrib: plus === e.v ? e.d : -e.d,
+    });
+
+    // 生成树上 x→y 的行走行（x、y 同根）：x 上溯到 LCA，再反向沿 y 的父边下来
+    const treePath = (x, y, depth, parentNode, parentEdge) => {
+      // 从子节点 a 沿其父边走向父节点时的行走行
+      const upRow = (a) => {
+        const e = parentEdge[a];
+        const back = a === index.get(e.v); // a 在登记终点一侧：行走方向为 v→u
+        return rowOf(e, back ? e.u : e.v, back ? e.v : e.u);
+      };
+      let a = x;
+      let b = y;
+      const up = [];
+      while (depth[a] > depth[b]) {
+        up.push(upRow(a));
+        a = parentNode[a];
+      }
+      const down = [];
+      while (depth[b] > depth[a]) {
+        down.push(upRow(b));
+        b = parentNode[b];
+      }
+      while (a !== b) {
+        up.push(upRow(a));
+        a = parentNode[a];
+        down.push(upRow(b));
+        b = parentNode[b];
+      }
+      // 下行段逐行逆向：正负端互换、贡献取反
+      for (let i = down.length - 1; i >= 0; i -= 1) {
+        const r = down[i];
+        up.push({ ...r, plus: r.minus, minus: r.plus, reversed: !r.reversed, contrib: -r.contrib });
+      }
+      return up;
+    };
+
+    for (const e of sorted) {
+      // 在 G−e 上以 BFS 建生成树并赋势；value[x] = x 的读数 − 根读数
+      const adj = new Array(n);
+      for (let i = 0; i < n; i += 1) adj[i] = [];
+      for (const g of sorted) {
+        if (g === e) continue;
+        adj[index.get(g.u)].push(g);
+        adj[index.get(g.v)].push(g);
+      }
+      const value = new Array(n).fill(null);
+      const parentNode = new Array(n).fill(-1);
+      const parentEdge = new Array(n).fill(null);
+      const depth = new Array(n).fill(0);
+      const rootOf = new Array(n).fill(-1);
+      const badByRoot = new Map(); // root -> 该分量第一条矛盾回边 {g, from}
+
+      for (let s = 0; s < n; s += 1) {
+        if (value[s] !== null || adj[s].length === 0) continue;
+        value[s] = 0n;
+        rootOf[s] = s;
+        const queue = [s];
+        for (let qi = 0; qi < queue.length; qi += 1) {
+          const x = queue[qi];
+          for (const g of adj[x]) {
+            // 从 x 走向另一端 y：顺登记方向（u→v）增量为 d，反向为 -d
+            const forward = index.get(g.u) === x;
+            const y = forward ? index.get(g.v) : index.get(g.u);
+            const w = forward ? g.d : -g.d;
+            if (value[y] === null) {
+              value[y] = value[x] + w;
+              parentNode[y] = x;
+              parentEdge[y] = g;
+              depth[y] = depth[x] + 1;
+              rootOf[y] = s;
+              queue.push(y);
+            } else if (!badByRoot.has(s) && value[y] - value[x] !== w) {
+              badByRoot.set(s, { g, from: x }); // 从 x 顺登记方向走向 y 即矛盾
+            }
+          }
+        }
+      }
+
+      const iu = index.get(e.u);
+      const iv = index.get(e.v);
+      if (value[iu] === null || value[iv] === null) continue; // 删掉 e 后两端不连通
+      if (rootOf[iu] !== rootOf[iv]) continue;
+
+      let ring = treePath(iu, iv, depth, parentNode, parentEdge);
+      let derived = value[iv] - value[iu]; // G−e 生成树推出的 x_v − x_u
+      if (derived === e.d) {
+        // 树路径恰好相容，但同一分量存在非零和矛盾环：经矛盾回边 g 绕道，
+        // u→from 走树、顺向过 g、to→v 走树，其和相对 e.d 偏离一个非零矛盾量。
+        const bad = badByRoot.get(rootOf[iu]);
+        if (!bad) continue;
+        const g = bad.g;
+        const from = bad.from;
+        const to = from === index.get(g.u) ? index.get(g.v) : index.get(g.u);
+        ring = treePath(iu, from, depth, parentNode, parentEdge);
+        // 从 from 走到 to（即 BFS 发现的矛盾方向）：行走式 x_to − x_from
+        ring.push(rowOf(g,
+          to === index.get(g.v) ? g.v : g.u,
+          from === index.get(g.v) ? g.v : g.u));
+        ring.push(...treePath(to, iv, depth, parentNode, parentEdge));
+        derived = 0n;
+        for (const r of ring) derived += r.contrib;
+      }
+      return { edge: e, derived, ring, value, rootOf };
+    }
+    return null;
+  }
+
+  /**
    * 离线求解全部检查点。
    *
    * @param {Array} ops 已通过语法/语义校验的操作序列：
@@ -213,66 +351,61 @@
     }
 
     // 3. 时间分治 DFS + 可回滚带势并查集
+    // 分治森林只用于判定可行性（相容时也提供稳定的势）；冲突见证改由
+    // canonicalWitness 从活动关系集合本身构造，避免森林形态随叶位置漂移。
     const dsu = new RollbackDSU(stations.length);
     const useCount = new Array(stations.length).fill(0);
     const activeIds = new Set();
-    let candidates = []; // 根→当前叶路径上发现的全部矛盾，稳定取关系标识最小者
+    const activeEdges = new Set();
+    let badOnPath = 0; // 根→当前路径上分治森林发现的矛盾次数（仅判定有无冲突）
 
-    // 环由 v→根（正向取）与 u→根（反向取）两条树路径拼成；
-    // rowDir = 环中该项 x_(+) − x_(−) 的正负端点名，contrib 为其相加取值。
-    const decorate = (path, sign) =>
-      path.map((p) => ({
-        id: p.edge.id,
-        u: p.edge.u,
-        v: p.edge.v,
-        d: p.edge.d,
-        line: p.edge.line,
-        plus: sign === 1 ? p.childAnchor : p.parentAnchor,
-        minus: sign === 1 ? p.parentAnchor : p.childAnchor,
-        // 环方向 x_plus−x_minus 是否与登记方向 x_v−x_u 相反
-        reversed: sign === 1
-          ? p.childAnchor === p.edge.u
-          : p.childAnchor === p.edge.v,
-        contrib: sign === 1 ? p.value : -p.value,
-      }));
+    // 矛盾见证只依赖活动关系集合：同一集合只规范构造一次并复用，
+    // 既省去重复计算，也在结构上保证不同检查点位置拿到完全相同的结论。
+    const witnessCache = new Map();
+    const witnessFor = () => {
+      const key = Array.from(activeEdges)
+        .sort(byIdAsc)
+        .map((e) => `${e.id}@${e.line}`)
+        .join(' ');
+      let w = witnessCache.get(key);
+      if (w === undefined) {
+        w = canonicalWitness(Array.from(activeEdges), stations.length, index);
+        witnessCache.set(key, w);
+      }
+      return w;
+    };
 
     const dfs = (node, l, r) => {
       const snap = dsu.snapshot();
       const applied = [];
-      const foundHere = [];
+      let badHere = 0;
 
-      // 稳定规则：节点内按登记行号升序贪心并入（与脚本时间顺序一致），
-      // 无法并入森林的闭合关系成为矛盾候选；叶节点在候选中取关系标识最小者。
+      // 节点内按登记行号升序并入（与脚本时间顺序一致），仅用于可行性判定
       const edges = tree[node].slice().sort(byLineAsc);
       for (const e of edges) {
         activeIds.add(e.id);
+        activeEdges.add(e);
         useCount[index.get(e.u)] += 1;
         useCount[index.get(e.v)] += 1;
         applied.push(e);
         if (stats) stats.unionCalls += 1;
         const rr = dsu.union(index.get(e.u), index.get(e.v), e.u, e.v, e.d, e);
-        if (!rr.ok) {
-          foundHere.push({
-            edge: e,
-            derived: rr.derived,
-            ring: decorate(rr.vPath, 1).concat(decorate(rr.uPath, -1)),
-          });
-        }
+        if (!rr.ok) badHere += 1;
       }
-      const candLenBefore = candidates.length;
-      candidates.push(...foundHere);
+      badOnPath += badHere;
 
       if (l === r) {
-        results[l - 1] = makeLeaf(l, dsu, stations, index, useCount, activeIds, candidates);
+        results[l - 1] = makeLeaf(l, badOnPath > 0);
       } else {
         const mid = (l + r) >> 1;
         dfs(node << 1, l, mid);
         dfs(node << 1 | 1, mid + 1, r);
       }
 
-      candidates.length = candLenBefore;
+      badOnPath -= badHere;
       for (const e of applied) {
         activeIds.delete(e.id);
+        activeEdges.delete(e);
         useCount[index.get(e.u)] -= 1;
         useCount[index.get(e.v)] -= 1;
       }
@@ -280,31 +413,50 @@
       dsu.rollback(snap);
     };
 
-    function makeLeaf(no, dsu, stations, index, useCount, activeIds, candidates) {
-      const potentials = [];
-      for (let i = 0; i < stations.length; i += 1) {
-        if (useCount[i] > 0) {
-          const f = dsu.find(i);
-          potentials.push({ name: stations[i], root: f.r, w: f.w });
+    function makeLeaf(no, hasConflict) {
+      let conflict = null;
+      let potentials;
+
+      if (hasConflict) {
+        // 见证只依赖当前活动关系集合：同一集合在任何检查点位置完全一致
+        const w = witnessFor();
+        if (w) {
+          let sum = 0n;
+          for (const row of w.ring) sum += row.contrib;
+          conflict = {
+            id: w.edge.id,
+            u: w.edge.u,
+            v: w.edge.v,
+            d: w.edge.d,
+            line: w.edge.line,
+            derived: w.derived,
+            sum,
+            ring: w.ring,
+          };
+          // 用 G−e 的规范生成树势展示读数（e 所在分量删掉 e 后仍连通）
+          potentials = [];
+          for (let i = 0; i < stations.length; i += 1) {
+            if (w.value[i] !== null) {
+              potentials.push({ name: stations[i], root: w.rootOf[i], w: w.value[i] });
+            }
+          }
+        } else {
+          // 不可能到达：分治已判定活动集合不相容，就必存在不相容环上的关系
+          throw new Error('internal: feasibility conflict without a canonical witness');
         }
       }
-      let conflict = null;
-      if (candidates.length > 0) {
-        // 稳定选择：关系标识字典序最小的矛盾环
-        const pick = candidates.slice().sort((a, b) => byIdAsc(a.edge, b.edge))[0];
-        let sum = 0n;
-        for (const row of pick.ring) sum += row.contrib;
-        conflict = {
-          id: pick.edge.id,
-          u: pick.edge.u,
-          v: pick.edge.v,
-          d: pick.edge.d,
-          line: pick.edge.line,
-          derived: pick.derived,
-          sum,
-          ring: pick.ring,
-        };
+
+      if (!conflict) {
+        // 相容：直接取分治森林的势
+        potentials = [];
+        for (let i = 0; i < stations.length; i += 1) {
+          if (useCount[i] > 0) {
+            const f = dsu.find(i);
+            potentials.push({ name: stations[i], root: f.r, w: f.w });
+          }
+        }
       }
+
       return {
         checkpoint: no,
         feasible: conflict === null,

@@ -34,7 +34,7 @@ test('登记 A→B=5、B→C=-2 后可行并可推导 A→C=3', () => {
   assert.equal(deriveAt(results[0], p.stations, 'B', 'C').value, -2n);
 });
 
-test('再登记 A→C=4 产生推导值 3 与冲突值 4 的矛盾环；撤回后恢复可行', () => {
+test('再登记 A→C=4 产生矛盾环：稳定选标识最小的环成员 r1（推导 6 与冲突 5）；撤回后恢复可行', () => {
   const script = [
     'stations: A,B,C',
     'r1: A→B=5',
@@ -50,16 +50,21 @@ test('再登记 A→C=4 产生推导值 3 与冲突值 4 的矛盾环；撤回�
   assert.equal(rs[1].feasible, false);
   assert.equal(rs[2].feasible, true);
 
+  // 不相容环上三条关系 r1/r2/r3 互为环成员，稳定规则取标识最小者 r1，
+  // 而不是后登记、在贪心并入时恰好闭合环的 r3。
   const c = rs[1].conflict;
-  assert.equal(c.id, 'r3');
-  assert.equal(c.derived, 3n, '推导值应为 3');
-  assert.equal(c.d, 4n, '冲突值应为 4');
-  assert.equal(c.sum, 3n, '环上各项相加应等于推导值');
-  // 环中逐项复算：r1 正向贡献 +5，r2 正向贡献 -2
+  assert.equal(c.id, 'r1');
+  // G−r1 上沿 r3（A→C=4）与反向 r2（C→B=2）推出 A→B=6
+  assert.equal(c.derived, 6n, '推导值应为 6');
+  assert.equal(c.d, 5n, '冲突值应为 r1 的登记值 5');
+  assert.equal(c.sum, 6n, '环上各项相加应等于推导值');
+  // 环中逐项复算：r3 正向贡献 +4，r2 反向使用贡献 +2
   const byId = Object.fromEntries(c.ring.map((r) => [r.id, r]));
-  assert.deepEqual(Object.keys(byId).sort(), ['r1', 'r2']);
-  assert.equal(byId.r1.contrib, 5n);
-  assert.equal(byId.r2.contrib, -2n);
+  assert.deepEqual(Object.keys(byId).sort(), ['r2', 'r3']);
+  assert.equal(byId.r3.contrib, 4n);
+  assert.equal(byId.r3.reversed, false);
+  assert.equal(byId.r2.contrib, 2n);
+  assert.equal(byId.r2.reversed, true);
   // 每一项与其声明方向一致或显式标记反向，且正负端确实是该关系的两个端点
   for (const row of c.ring) {
     const ends = [row.plus, row.minus].sort();
@@ -68,6 +73,53 @@ test('再登记 A→C=4 产生推导值 3 与冲突值 4 的矛盾环；撤回�
   // 撤回后 r3 不在活动集合
   assert.deepEqual(rs[2].activeIds, ['r1', 'r2']);
   assert.equal(deriveAt(rs[2], pp.stations, 'A', 'C').value, 3n);
+});
+
+test('回归：同一活动集合在连续检查点上给出同一矛盾环标识（C/D 偏移场景）', () => {
+  // 业务路径：
+  //   e0: C→D=2 建检查点；e1: D→C=-1 建检查点；
+  //   不改变活动关系连续两个检查点；撤回 e0 后再两个检查点。
+  const script = [
+    'stations: C,D',
+    'e0: C→D=2',
+    'checkpoint', // 1 无冲突
+    'e1: D→C=-1',
+    'checkpoint', // 2 冲突：环成员 e0/e1 中稳定选最小标识 e0
+    'checkpoint', // 3 同样的活动集合，必须仍是 e0
+    'checkpoint', // 4 同样的活动集合，必须仍是 e0
+    'withdraw e0',
+    'checkpoint', // 5 撤回后恢复可行
+    'checkpoint', // 6 仍可行
+  ].join('\n');
+  const { results: rs } = runScript(script);
+  assert.equal(rs.length, 6);
+  assert.deepEqual(
+    rs.map((r) => (r.conflict ? r.conflict.id : null)),
+    [null, 'e0', 'e0', 'e0', null, null],
+  );
+  assert.deepEqual(rs.map((r) => r.feasible), [true, false, false, false, true, true]);
+  // 第 2、3、4 个检查点活动关系完全相同，见证也必须逐字段相同
+  for (const k of [1, 2, 3]) {
+    assert.deepEqual(rs[k].activeIds, ['e0', 'e1']);
+    assert.equal(rs[k].conflict.id, 'e0');
+    assert.equal(rs[k].conflict.u, 'C');
+    assert.equal(rs[k].conflict.v, 'D');
+    // e1: D→C=-1 ⇒ x_C−x_D=1，与 e0 给出的 x_D−x_C=2 冲突
+    assert.equal(rs[k].conflict.derived, 1n, '由 e1 推导的 C→D 应为 1');
+    assert.equal(rs[k].conflict.d, 2n, '冲突值应为 e0 登记的 2');
+    assert.equal(rs[k].conflict.sum, 1n);
+    assert.equal(rs[k].conflict.ring.length, 1);
+    assert.equal(rs[k].conflict.ring[0].id, 'e1');
+    assert.equal(rs[k].conflict.ring[0].reversed, true, 'e1 需反向使用');
+    assert.equal(rs[k].conflict.ring[0].contrib, 1n);
+  }
+  assert.deepEqual(JSON.stringify(rs[1].conflict, bigReplacer), JSON.stringify(rs[3].conflict, bigReplacer));
+  // 撤回 e0 后 e1 单独活动：x_C−x_D=1 可行
+  for (const k of [4, 5]) {
+    assert.deepEqual(rs[k].activeIds, ['e1']);
+    assert.equal(rs[k].conflict, null);
+    assert.equal(deriveAt(rs[k], ['C', 'D'], 'C', 'D').value, 1n);
+  }
 });
 
 test('撤回后可用同一标识重新登记，后续检查点采用新值', () => {
@@ -85,9 +137,10 @@ test('撤回后可用同一标识重新登记，后续检查点采用新值', ()
   assert.equal(deriveAt(results[1], p.stations, 'A', 'B').value, 7n);
 });
 
-test('矛盾环选择稳定：多个冲突时始终选关系标识最小者，环可逐项复算', () => {
-  // 三角形先固定 A→B=1, B→C=1（推出 A→C=2）
-  // 再登记 zbad A→C=5 与 abad A→C=9：两处冲突，应稳定选 abad
+test('矛盾环选择稳定：始终选处于不相容环上的关系标识最小者，环可逐项复算', () => {
+  // 三角形先固定 ab: A→B=1, bc: B→C=1（推出 A→C=2）
+  // 再登记 zbad A→C=5 与 abad A→C=9：四条关系同属一个不相容环，
+  // 稳定规则取环成员中标识最小者 ab（而非某条“闭合边”）。
   const { results } = runScript([
     'stations: A,B,C',
     'ab: A→B=1',
@@ -97,9 +150,10 @@ test('矛盾环选择稳定：多个冲突时始终选关系标识最小者，�
     'checkpoint',
   ].join('\n'));
   assert.equal(results[0].feasible, false);
-  assert.equal(results[0].conflict.id, 'abad');
-  assert.equal(results[0].conflict.derived, 2n);
-  assert.equal(results[0].conflict.d, 9n);
+  assert.equal(results[0].conflict.id, 'ab');
+  // G−ab 上沿 abad(A→C=9) 与反向 bc(C→B=-1) 推出 A→B=8，与 ab 的 1 冲突
+  assert.equal(results[0].conflict.derived, 8n);
+  assert.equal(results[0].conflict.d, 1n);
 });
 
 test('同一脚本重复求解结论一致（树形态确定，无路径压缩副作用）', () => {
@@ -117,7 +171,7 @@ test('同一脚本重复求解结论一致（树形态确定，无路径压缩�
   assert.equal(deriveAt(r1[0], p.stations, 'A', 'D').value, 6n);
 });
 
-test('不相容时跨检查点区间分治：中间区间冲突、首尾可行', () => {
+test('不相容时跨检查点区间分治：中间区间冲突、首尾可行，矛盾环标识跨检查点稳定', () => {
   const { results } = runScript([
     'stations: A,B,C',
     'a: A→B=1',
@@ -125,12 +179,18 @@ test('不相容时跨检查点区间分治：中间区间冲突、首尾可行',
     'checkpoint',            // 1 可行
     'x: A→C=9',
     'checkpoint',            // 2 冲突
-    'checkpoint',            // 3 仍冲突（关系持续活动）
+    'checkpoint',            // 3 同一活动集合，矛盾环标识必须不变
     'withdraw x',
     'checkpoint',            // 4 恢复
   ].join('\n'));
   assert.deepEqual(results.map((r) => r.feasible), [true, false, false, true]);
-  assert.equal(results[2].conflict.id, 'x');
+  // 环成员 a/b/x 中标识最小者为 a；cp2、cp3 见证必须完全一致
+  assert.equal(results[1].conflict.id, 'a');
+  assert.equal(results[2].conflict.id, 'a');
+  assert.deepEqual(
+    JSON.stringify(results[1].conflict, bigReplacer),
+    JSON.stringify(results[2].conflict, bigReplacer),
+  );
 });
 
 test('并入次数随区间分治 O(E log K)，明显小于“每检查点重扫活动关系”', () => {
@@ -310,13 +370,20 @@ test('随机性质：分治求解与逐检查点重扫的朴素预言机结论�
     const want = naiveSolve(ops, stations);
     assert.equal(got.length, want.length, `trial ${trial} 检查点数`);
 
-    // 重放操作以取得每个检查点的活动标识集合
+    // 重放操作以取得每个检查点的活动标识集合；
+    // 同一“活动边实例集合”（含登记行与值）在不同检查点上的见证必须完全相同
     const live = new Set();
+    const liveOps = new Map(); // id -> 当前活动的登记 op（区分撤回后重新登记）
+    const witnessBySignature = new Map();
     let cp = 0;
     for (const op of ops) {
-      if (op.kind === 'reg') live.add(op.id);
-      else if (op.kind === 'withdraw') live.delete(op.id);
-      else {
+      if (op.kind === 'reg') {
+        live.add(op.id);
+        liveOps.set(op.id, op);
+      } else if (op.kind === 'withdraw') {
+        live.delete(op.id);
+        liveOps.delete(op.id);
+      } else {
         const k = cp;
         // 可行性与并入顺序无关，必须与朴素重扫一致
         assert.equal(got[k].feasible, want[k].feasible,
@@ -330,6 +397,18 @@ test('随机性质：分治求解与逐检查点重扫的朴素预言机结论�
         if (!want[k].feasible) {
           assert.ok(got[k].conflict, `trial ${trial} cp${k + 1} 应给出矛盾环`);
           verifyWitness(got[k].conflict, new Set(live));
+          // 核心回归：相同活动集合在不同检查点位置给出逐字段相同的矛盾环
+          const sig = Array.from(liveOps.values())
+            .map((e) => `${e.id}@${e.line}:${e.u}>${e.v}=${e.d}`)
+            .sort()
+            .join('|');
+          const cur = JSON.stringify(got[k].conflict, bigReplacer);
+          if (witnessBySignature.has(sig)) {
+            assert.equal(cur, witnessBySignature.get(sig),
+              `trial ${trial} cp${k + 1} 同一活动集合的矛盾环随检查点位置漂移`);
+          } else {
+            witnessBySignature.set(sig, cur);
+          }
         } else {
           for (let i = 0; i < n; i += 1) {
             for (let j = 0; j < n; j += 1) {
