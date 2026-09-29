@@ -117,6 +117,69 @@ test('同一脚本重复求解结论一致（树形态确定，无路径压缩�
   assert.equal(deriveAt(r1[0], p.stations, 'A', 'D').value, 6n);
 });
 
+test('相同活动关系集合在不同检查点稳定选择同一矛盾环（登记-连续检查点-撤回）', () => {
+  // 业务回归：同一对站点 C、D 上 e0(C→D=2) 与 e1(D→C=-1，即 C→D=1) 矛盾。
+  // 旧版本中 e0/e1 落在线段树不同节点，第 2、3 个检查点报 e1、第 4 个报 e0，
+  // 同一活动集合 e0,e1 得到不同见证。修复后三处必须稳定选标识最小的 e0，
+  // 展示由 e1 推出的 C→D=1 与 e0 的登记值 2 冲突；撤回 e0 后恢复可行。
+  const script = [
+    'stations: C,D',
+    'e0: C→D=2',
+    'checkpoint', // 1 仅 e0 活动，无冲突
+    'e1: D→C=-1',
+    'checkpoint', // 2 冲突
+    'checkpoint', // 3 活动关系未变，仍冲突且见证相同
+    'checkpoint', // 4 活动关系未变，仍冲突且见证相同
+    'withdraw e0',
+    'checkpoint', // 5 仅剩 e1，恢复可行
+    'checkpoint', // 6 仍可行
+  ].join('\n');
+  const { results, p } = runScript(script);
+
+  assert.equal(results.length, 6);
+  assert.deepEqual(results.map((r) => r.checkpoint), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(results.map((r) => (r.conflict ? r.conflict.id : null)),
+    [null, 'e0', 'e0', 'e0', null, null]);
+  assert.deepEqual(results[0].activeIds, ['e0']);
+  assert.deepEqual(results[1].activeIds, ['e0', 'e1']);
+  assert.deepEqual(results[2].activeIds, ['e0', 'e1']);
+  assert.deepEqual(results[3].activeIds, ['e0', 'e1']);
+  assert.deepEqual(results[4].activeIds, ['e1']);
+  assert.deepEqual(results[5].activeIds, ['e1']);
+
+  // 三个冲突检查点的见证必须完全一致
+  for (const k of [1, 2, 3]) {
+    const c = results[k].conflict;
+    assert.equal(c.id, 'e0', `检查点 ${k + 1} 应稳定选取标识最小的 e0`);
+    assert.equal(c.u, 'C');
+    assert.equal(c.v, 'D');
+    assert.equal(c.derived, 1n, `检查点 ${k + 1} 应由 e1 推出 C→D=1`);
+    assert.equal(c.d, 2n, `检查点 ${k + 1} 冲突值应为 e0 登记的 2`);
+    assert.equal(c.sum, 1n, '环中各式相加应等于推导值 1');
+    // 环只由 e1 构成，反向使用 e1 的登记 D→C=-1：x_D − x_C = 1
+    assert.equal(c.ring.length, 1);
+    assert.equal(c.ring[0].id, 'e1');
+    assert.equal(c.ring[0].plus, 'D');
+    assert.equal(c.ring[0].minus, 'C');
+    assert.equal(c.ring[0].reversed, true);
+    assert.equal(c.ring[0].contrib, 1n);
+  }
+  assert.deepEqual(
+    JSON.stringify(results[1].conflict, bigReplacer),
+    JSON.stringify(results[2].conflict, bigReplacer),
+  );
+  assert.deepEqual(
+    JSON.stringify(results[2].conflict, bigReplacer),
+    JSON.stringify(results[3].conflict, bigReplacer),
+  );
+
+  // 撤回 e0 后 D→C=-1 可独立成立：C→D=1
+  assert.equal(results[4].feasible, true);
+  assert.equal(results[5].feasible, true);
+  assert.equal(deriveAt(results[4], p.stations, 'C', 'D').value, 1n);
+  assert.equal(deriveAt(results[5], p.stations, 'D', 'C').value, -1n);
+});
+
 test('不相容时跨检查点区间分治：中间区间冲突、首尾可行', () => {
   const { results } = runScript([
     'stations: A,B,C',

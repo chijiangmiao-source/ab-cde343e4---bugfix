@@ -107,6 +107,57 @@ if (parsed.ok) {
   check('检查点 3 重新推导 A→C = 3', d3 && d3.status === 'ok' && d3.value === 3n);
 }
 
+/* ---------- 阶段 1b：相同活动集合跨检查点的矛盾环标识必须稳定 ---------- */
+section('阶段 1b：登记—连续检查点—撤回，矛盾环标识只由活动关系决定');
+
+const stableScript = [
+  'stations: C,D',
+  'e0: C→D=2',
+  'checkpoint', // 1：仅 e0，无冲突
+  'e1: D→C=-1', // 与 e0 矛盾：e1 推出 C→D=1，e0 给出 2
+  'checkpoint', // 2：冲突，应稳定选标识最小的 e0
+  'checkpoint', // 3：活动关系未变，见证必须与检查点 2 完全相同
+  'checkpoint', // 4：同上（旧版本在此错误改报 e0/另一标识）
+  'withdraw e0',
+  'checkpoint', // 5：仅剩 e1，恢复可行
+  'checkpoint', // 6：仍可行
+].join('\n');
+
+const parsedStable = parseScript(stableScript);
+check('稳定场景脚本能无错误解析', parsedStable.ok, JSON.stringify(parsedStable.errors));
+
+if (parsedStable.ok) {
+  const rs = solveAudit(parsedStable.ops, parsedStable.stations);
+  check('共得到 6 个检查点结论', rs.length === 6, `实际 ${rs.length}`);
+  check(
+    '六个检查点矛盾环标识依次为：无、e0、e0、e0、无、无',
+    JSON.stringify(rs.map((r) => (r.conflict ? r.conflict.id : null)))
+      === JSON.stringify([null, 'e0', 'e0', 'e0', null, null]),
+    JSON.stringify(rs.map((r) => (r.conflict ? r.conflict.id : null))),
+  );
+  for (const k of [1, 2, 3]) {
+    const c = rs[k] && rs[k].conflict;
+    check(`检查点 ${k + 1} 展示 e1 推导 C→D = 1`, c && c.u === 'C' && c.v === 'D' && c.derived === 1n,
+      c && `id=${c.id} ${c.u}→${c.v} derived=${c && c.derived}`);
+    check(`检查点 ${k + 1} 与 e0 登记值 2 冲突`, c && c.d === 2n, c && String(c.d));
+    check(`检查点 ${k + 1} 环中各式相加 ∑ = 1`, c && c.sum === 1n, c && String(c && c.sum));
+    check(`检查点 ${k + 1} 活动关系为 e0、e1`,
+      c && JSON.stringify(rs[k].activeIds) === JSON.stringify(['e0', 'e1']));
+  }
+  check('三个冲突检查点的见证彼此完全一致',
+    JSON.stringify(rs[1].conflict, bigReplacer) === JSON.stringify(rs[2].conflict, bigReplacer)
+      && JSON.stringify(rs[2].conflict, bigReplacer) === JSON.stringify(rs[3].conflict, bigReplacer));
+  check('撤回 e0 后检查点 5、6 恢复可行',
+    rs[4] && rs[4].feasible === true && rs[5] && rs[5].feasible === true);
+  const d5 = rs[4] && deriveAt(rs[4], parsedStable.stations, 'C', 'D');
+  check('撤回后由 e1 推导 C→D = 1', d5 && d5.status === 'ok' && d5.value === 1n,
+    d5 && `${d5.status} ${d5.value}`);
+}
+
+function bigReplacer(_k, v) {
+  return typeof v === 'bigint' ? v.toString() : v;
+}
+
 /* ---------- 阶段 2：代码测试 ---------- */
 section('阶段 2：代码测试 node --test test/');
 const testCode = await run('node', ['--test', 'test/']);

@@ -11,6 +11,14 @@
  *      回滚即恢复 parent/size/pot/link，总复杂度 O((E+K) log K · α)。
  *   4. 合并已连通的两端时若 pot 推出的偏移与登记值不符，即得到一个矛盾环。
  *
+ * 矛盾环的见证必须只由“当前检查点仍活动的关系”稳定决定，与检查点在线段树
+ * 中的位置无关。分治树各节点的并查集只负责判定“相容 / 不相容”；一旦叶检查点
+ * 不相容，就用一台全新并查集把该叶节点的全部活动关系按登记行号升序重放一遍，
+ * 在重放中收集所有闭合矛盾（同一对端点上两条互斥登记构成的二元矛盾环里两条
+ * 关系互为闭合边，两个方向都收集），再取关系标识最小者。重放只依赖活动集合
+ * 本身，与区间在树中的切分和按大小合并的树形态无关，因而同一活动集合在任意
+ * 检查点都得到同一见证。
+ *
  * 同一份文件既可作为浏览器普通脚本（window.DSCable），也可在 Node 中被测试引用。
  */
 (function (root, factory) {
@@ -141,6 +149,86 @@
   }
 
   /**
+   * 由“当前检查点的活动关系集合”确定性地选出矛盾环见证，与区间分治树的
+   * 节点切分完全无关：
+   *   - 用一台全新的并查集按登记行号（其次标识）升序贪心并入全部活动关系，
+   *     无法并入森林的闭合关系成为候选；
+   *   - 长度为 2 的矛盾环（同一对端点上两条互相矛盾的登记）中两条关系互为
+   *     闭合边，另一条同样登记为候选，按其登记方向反推推导值；
+   *   - 候选中取关系标识最小者。
+   * 同一活动集合无论出现在哪个检查点，输入本函数的边集与并入顺序都相同，
+   * 因而见证稳定。仅在检查点已判定不相容时调用。
+   */
+  function canonicalConflict(activeEdges, index) {
+    const dsu = new RollbackDSU(index.size);
+    const candidates = [];
+
+    const decorate = (path, sign) =>
+      path.map((p) => ({
+        id: p.edge.id,
+        u: p.edge.u,
+        v: p.edge.v,
+        d: p.edge.d,
+        line: p.edge.line,
+        plus: sign === 1 ? p.childAnchor : p.parentAnchor,
+        minus: sign === 1 ? p.parentAnchor : p.childAnchor,
+        reversed: sign === 1
+          ? p.childAnchor === p.edge.u
+          : p.childAnchor === p.edge.v,
+        contrib: sign === 1 ? p.value : -p.value,
+      }));
+
+    for (const e of activeEdges) {
+      const rr = dsu.union(index.get(e.u), index.get(e.v), e.u, e.v, e.d, e);
+      if (rr.ok) continue;
+      candidates.push({
+        edge: e,
+        derived: rr.derived,
+        ring: decorate(rr.vPath, 1).concat(decorate(rr.uPath, -1)),
+      });
+      // 二元矛盾环：另一条关系也可作闭合边
+      if (rr.vPath.length + rr.uPath.length === 1) {
+        const row = rr.vPath.length === 1 ? rr.vPath[0] : rr.uPath[0];
+        const f = row.edge;
+        const sameOrientation = f.u === e.u && f.v === e.v;
+        if (sameOrientation || (f.u === e.v && f.v === e.u)) {
+          const derivedF = sameOrientation ? e.d : -e.d;
+          candidates.push({
+            edge: f,
+            derived: derivedF,
+            ring: [{
+              id: e.id,
+              u: e.u,
+              v: e.v,
+              d: e.d,
+              line: e.line,
+              plus: f.v,
+              minus: f.u,
+              reversed: !sameOrientation,
+              contrib: derivedF,
+            }],
+          });
+        }
+      }
+    }
+
+    candidates.sort((a, b) => byIdAsc(a.edge, b.edge));
+    const pick = candidates[0];
+    let sum = 0n;
+    for (const row of pick.ring) sum += row.contrib;
+    return {
+      id: pick.edge.id,
+      u: pick.edge.u,
+      v: pick.edge.v,
+      d: pick.edge.d,
+      line: pick.edge.line,
+      derived: pick.derived,
+      sum,
+      ring: pick.ring,
+    };
+  }
+
+  /**
    * 离线求解全部检查点。
    *
    * @param {Array} ops 已通过语法/语义校验的操作序列：
@@ -216,63 +304,47 @@
     const dsu = new RollbackDSU(stations.length);
     const useCount = new Array(stations.length).fill(0);
     const activeIds = new Set();
-    let candidates = []; // 根→当前叶路径上发现的全部矛盾，稳定取关系标识最小者
-
-    // 环由 v→根（正向取）与 u→根（反向取）两条树路径拼成；
-    // rowDir = 环中该项 x_(+) − x_(−) 的正负端点名，contrib 为其相加取值。
-    const decorate = (path, sign) =>
-      path.map((p) => ({
-        id: p.edge.id,
-        u: p.edge.u,
-        v: p.edge.v,
-        d: p.edge.d,
-        line: p.edge.line,
-        plus: sign === 1 ? p.childAnchor : p.parentAnchor,
-        minus: sign === 1 ? p.parentAnchor : p.childAnchor,
-        // 环方向 x_plus−x_minus 是否与登记方向 x_v−x_u 相反
-        reversed: sign === 1
-          ? p.childAnchor === p.edge.u
-          : p.childAnchor === p.edge.v,
-        contrib: sign === 1 ? p.value : -p.value,
-      }));
+    const activeEdges = new Set(); // 与 activeIds 同步，供冲突叶节点规范化见证
+    let conflictMarks = []; // 根→当前叶路径上发现的矛盾（仅需标记是否不相容）
+    // 相同活动集合规范化结果缓存：键为活动关系登记行号升序序列（每次登记行号唯一，
+    // 足以区分撤回后重新登记的同一标识）。连续多个不相容检查点且关系不变时只重放一次。
+    const conflictCache = new Map();
 
     const dfs = (node, l, r) => {
       const snap = dsu.snapshot();
       const applied = [];
       const foundHere = [];
 
-      // 稳定规则：节点内按登记行号升序贪心并入（与脚本时间顺序一致），
-      // 无法并入森林的闭合关系成为矛盾候选；叶节点在候选中取关系标识最小者。
+      // 节点内按登记行号升序贪心并入（与脚本时间顺序一致）；
+      // 无法并入森林的闭合关系只作为“不相容”标记。矛盾环的具体见证不在此
+      // 缓存——分治树形态随节点切分而变，缓存路径会让同一活动集合在不同
+      // 检查点得到不同环；冲突叶节点改由 canonicalConflict 按活动集合规范化。
       const edges = tree[node].slice().sort(byLineAsc);
       for (const e of edges) {
         activeIds.add(e.id);
+        activeEdges.add(e);
         useCount[index.get(e.u)] += 1;
         useCount[index.get(e.v)] += 1;
         applied.push(e);
         if (stats) stats.unionCalls += 1;
         const rr = dsu.union(index.get(e.u), index.get(e.v), e.u, e.v, e.d, e);
-        if (!rr.ok) {
-          foundHere.push({
-            edge: e,
-            derived: rr.derived,
-            ring: decorate(rr.vPath, 1).concat(decorate(rr.uPath, -1)),
-          });
-        }
+        if (!rr.ok) foundHere.push(e);
       }
-      const candLenBefore = candidates.length;
-      candidates.push(...foundHere);
+      const markLenBefore = conflictMarks.length;
+      conflictMarks.push(...foundHere);
 
       if (l === r) {
-        results[l - 1] = makeLeaf(l, dsu, stations, index, useCount, activeIds, candidates);
+        results[l - 1] = makeLeaf(l, dsu, stations, index, useCount, activeIds, activeEdges, conflictMarks);
       } else {
         const mid = (l + r) >> 1;
         dfs(node << 1, l, mid);
         dfs(node << 1 | 1, mid + 1, r);
       }
 
-      candidates.length = candLenBefore;
+      conflictMarks.length = markLenBefore;
       for (const e of applied) {
         activeIds.delete(e.id);
+        activeEdges.delete(e);
         useCount[index.get(e.u)] -= 1;
         useCount[index.get(e.v)] -= 1;
       }
@@ -280,7 +352,7 @@
       dsu.rollback(snap);
     };
 
-    function makeLeaf(no, dsu, stations, index, useCount, activeIds, candidates) {
+    function makeLeaf(no, dsu, stations, index, useCount, activeIds, activeEdges, conflictMarks) {
       const potentials = [];
       for (let i = 0; i < stations.length; i += 1) {
         if (useCount[i] > 0) {
@@ -289,21 +361,16 @@
         }
       }
       let conflict = null;
-      if (candidates.length > 0) {
-        // 稳定选择：关系标识字典序最小的矛盾环
-        const pick = candidates.slice().sort((a, b) => byIdAsc(a.edge, b.edge))[0];
-        let sum = 0n;
-        for (const row of pick.ring) sum += row.contrib;
-        conflict = {
-          id: pick.edge.id,
-          u: pick.edge.u,
-          v: pick.edge.v,
-          d: pick.edge.d,
-          line: pick.edge.line,
-          derived: pick.derived,
-          sum,
-          ring: pick.ring,
-        };
+      if (conflictMarks.length > 0) {
+        // 见证只由当前活动关系集合决定：按登记行号序重放，稳定取标识最小矛盾环。
+        const edgesSorted = Array.from(activeEdges).sort(byLineAsc);
+        const cacheKey = edgesSorted.map((e) => e.line).join(',');
+        let c = conflictCache.get(cacheKey);
+        if (!c) {
+          c = canonicalConflict(edgesSorted, index);
+          conflictCache.set(cacheKey, c);
+        }
+        conflict = c;
       }
       return {
         checkpoint: no,
